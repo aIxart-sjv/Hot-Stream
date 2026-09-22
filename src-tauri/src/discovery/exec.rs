@@ -16,6 +16,43 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, Di
     run_with_stdin(program, args, None, timeout)
 }
 
+/// `Command::spawn`, retrying a few times on `ExecutableFileBusy` (`ETXTBSY`).
+///
+/// This is a real, documented Linux/glibc race, not a Hot-Stream bug: when one thread of a
+/// multi-threaded process `fork()`s (which `Command::spawn` does internally) while another
+/// thread anywhere in the same process has recently written and is about to execute a *freshly
+/// created* file, the kernel can spuriously report the target as busy, even though nothing is
+/// actually still writing to it. It is inherently transient — the standard, widely-used fix
+/// (e.g. in Python's `subprocess` and elsewhere) is exactly this: retry briefly.
+///
+/// Hot-Stream's own real usage never triggers this naturally: `iw`, `ip`, `nft` and the helper
+/// binary are all pre-existing, stable files, never freshly written by Hot-Stream itself in
+/// the same run. It was only ever observed (and is reproduced) in this project's own test
+/// suite, which writes small fake-helper scripts to a temp file and executes them immediately
+/// afterwards, from many threads at once. Kept here rather than duplicated per test because it
+/// is a property of `spawn` in general, harmless for every other caller.
+fn spawn_retrying_on_text_busy(program: &str, args: &[&str], with_stdin: bool) -> std::io::Result<std::process::Child> {
+    const MAX_ATTEMPTS: u32 = 50;
+    const RETRY_DELAY: Duration = Duration::from_millis(10);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let result = Command::new(program)
+            .args(args)
+            .env("LC_ALL", "C")
+            .stdin(if with_stdin { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match result {
+            Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && attempt < MAX_ATTEMPTS => {
+                thread::sleep(RETRY_DELAY);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Like [`run`], but writes `stdin` to the program's standard input first (e.g. an `nft -f -`
 /// script). `None` behaves exactly like `run` (stdin closed immediately).
 pub fn run_with_stdin(
@@ -25,13 +62,7 @@ pub fn run_with_stdin(
     timeout: Duration,
 ) -> Result<String, DiscoveryError> {
     let tool = program.to_string();
-    let mut child = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut child = spawn_retrying_on_text_busy(program, args, stdin.is_some())
         .map_err(|e| match e.kind() {
             ErrorKind::NotFound => DiscoveryError::ToolMissing { tool: tool.clone() },
             _ => DiscoveryError::CommandFailed {

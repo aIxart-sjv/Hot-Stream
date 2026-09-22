@@ -11,6 +11,8 @@
   --alert-bg: #fde3e3;
   --blocked: #b3261e;
   --blocked-bg: #fbe9e7;
+  --denied: #9a6300;
+  --denied-bg: #fff3d6;
   --accent: #2a5adf;
   font: 14px/1.45 system-ui, sans-serif;
 }
@@ -28,6 +30,8 @@
     --alert-bg: #4a2222;
     --blocked: #ff8a80;
     --blocked-bg: #3a1f1d;
+    --denied: #e0b23d;
+    --denied-bg: #3a2f10;
     --accent: #6ea1ff;
   }
 }
@@ -98,6 +102,8 @@ tr:last-child td { border-bottom: 0; }
 tr.connecting td { color: var(--muted); font-style: italic; }
 tr.blocked td { color: var(--blocked); }
 tr.blocked { background: var(--blocked-bg); }
+tr.deniedMax td { color: var(--denied); }
+tr.deniedMax { background: var(--denied-bg); }
 
 .mono { font-family: ui-monospace, monospace; font-size: 13px; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -116,6 +122,67 @@ button.block, button.unblock {
 button.block:hover:not(:disabled) { border-color: var(--blocked); color: var(--blocked); }
 button.unblock:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 button.block:disabled, button.unblock:disabled { opacity: 0.5; cursor: default; }
+
+.admission {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  font-size: 13px;
+}
+.admission label { color: var(--muted); }
+.max-input {
+  width: 70px;
+  font: inherit;
+  padding: 4px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+}
+.admission button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+  cursor: pointer;
+}
+.admission button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.admission button:disabled { opacity: 0.5; cursor: default; }
+
+td.bandwidth {
+  white-space: nowrap;
+}
+.rate-label {
+  color: var(--muted);
+  font-size: 12px;
+}
+.rate-input {
+  width: 52px;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 5px;
+  margin: 0 4px 0 2px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+}
+button.apply-rate {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: inherit;
+  cursor: pointer;
+}
+button.apply-rate:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.apply-rate:disabled { opacity: 0.5; cursor: default; }
 
 .badge {
   font-family: system-ui, sans-serif;

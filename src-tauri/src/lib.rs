@@ -10,6 +10,8 @@ pub fn run() {
             commands::get_enforcement_state,
             commands::block_client,
             commands::unblock_client,
+            commands::set_admission,
+            commands::set_bandwidth,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hot-Stream");
