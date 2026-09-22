@@ -45,10 +45,15 @@
 //!
 //! This binary intentionally does not depend on `tauri`: it is built and audited as a small,
 //! separate program, not as part of the GUI.
+//!
+//! Every mutating command (everything but `status`) holds a process-wide `flock()` for its
+//! whole read-modify-write cycle — see `enforce::lock` for the real, reproduced race this
+//! closes (two `hot-stream-helper` invocations racing, e.g. from two rapid GUI clicks, silently
+//! discarding one another's change).
 
 use std::process::ExitCode;
 
-use hot_stream_lib::enforce::{ambient, kernel, shaping, EnforcementState};
+use hot_stream_lib::enforce::{ambient, kernel, lock, shaping, EnforcementState};
 
 fn usage() -> ! {
     eprintln!(
@@ -120,6 +125,23 @@ fn main() -> ExitCode {
     // this alone.
     let ambient_raised = ambient::raise_net_admin();
 
+    // Serializes this invocation's whole read-modify-write cycle against any other
+    // concurrently-running mutating command — see `enforce::lock` for the exact race this
+    // closes. `status` is read-only and skips it: reading concurrently with a write is safe,
+    // since the next read after any write simply reflects the kernel's latest state, per this
+    // crate's "kernel state is the only truth" principle throughout.
+    let _lock = if args[0] == "status" {
+        None
+    } else {
+        match lock::acquire() {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!("could not acquire the coordination lock: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     // Every mutating command below applies its own change, then re-reads the *complete*
     // picture (both `nft`-based policies and, since `iface` is always known at this point,
     // fresh `tc` state too) rather than returning just the one policy it happened to change.
@@ -148,7 +170,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok(state) => {
-            println!("{}", serde_json::to_string(&state).expect("BlockedState always serialises"));
+            println!("{}", serde_json::to_string(&state).expect("EnforcementState always serialises"));
             ExitCode::SUCCESS
         }
         Err(message) => {

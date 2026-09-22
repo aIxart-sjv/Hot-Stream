@@ -117,3 +117,9 @@ export function parseRateInput(text: string): { valid: true; kbit: number | null
 export function isBandwidthLimited(limit: BandwidthLimit | { downloadKbit: number | null; uploadKbit: number | null } | null): boolean {
   return limit !== null && (limit.downloadKbit !== null || limit.uploadKbit !== null);
 }
+
+/** One line summarising both directions, for a "limited" badge's tooltip — e.g. "Download 5
+ *  Mbps, Upload unlimited". */
+export function describeLimit(limit: { downloadKbit: number | null; uploadKbit: number | null }): string {
+  return `Download ${formatRate(limit.downloadKbit)}, Upload ${formatRate(limit.uploadKbit)}`;
+}

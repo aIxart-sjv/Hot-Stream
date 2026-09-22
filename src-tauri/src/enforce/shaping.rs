@@ -90,6 +90,14 @@ pub enum ShapingError {
     /// The kernel's state right after applying does not match what was requested. A real
     /// problem, never hidden — same principle as `kernel::EnforceError::Inconsistent`.
     Inconsistent { detail: String },
+    /// `dev`'s root qdisc is neither already ours nor one of the recognised unconfigured
+    /// defaults — refused rather than silently replaced, since it was most plausibly set up
+    /// deliberately by something else. See `SAFE_DEFAULT_ROOT_QDISCS`.
+    ForeignRootQdisc { dev: String, kind: String },
+    /// `iface` already has an ingress qdisc that is not the one Hot-Stream itself created (a
+    /// device can only ever have one). Upload shaping needs that hook and cannot share or
+    /// replace whatever already claimed it without risking that tool's own behaviour.
+    ForeignIngressQdisc { iface: String },
 }
 
 impl fmt::Display for ShapingError {
@@ -105,6 +113,16 @@ impl fmt::Display for ShapingError {
             ShapingError::Inconsistent { detail } => {
                 write!(f, "kernel state after applying does not match what was requested: {detail}")
             }
+            ShapingError::ForeignRootQdisc { dev, kind } => write!(
+                f,
+                "refusing to replace {dev}'s existing {kind:?} root queueing discipline — it was not created by \
+                 Hot-Stream and may be in deliberate use by something else"
+            ),
+            ShapingError::ForeignIngressQdisc { iface } => write!(
+                f,
+                "{iface} already has an ingress queueing discipline that Hot-Stream did not create — upload \
+                 limits cannot be enabled without risking whatever else is using it"
+            ),
         }
     }
 }
@@ -216,6 +234,30 @@ fn has_our_htb_root(dev: &str) -> Result<bool, ShapingError> {
     Ok(list_qdiscs(dev, None)?.iter().any(|q| q.kind == "htb" && q.handle == ROOT_HANDLE && q.root))
 }
 
+/// Root qdisc kinds that are safe to unconditionally replace with our own HTB hierarchy: the
+/// unconfigured defaults Linux actually assigns, confirmed directly rather than assumed —
+/// `noqueue` on the real hotspot interface (Wi-Fi drivers manage their own queueing, bypassing
+/// the sysctl default entirely), and `fq_codel` on a freshly-created `hotstream0` IFB device,
+/// which has no such driver-level override and so falls back to whatever `net.core.
+/// default_qdisc` is set to — `fq_codel` on this machine, and the kernel's own recommended
+/// value since Linux 4.12, so a safe general assumption rather than a quirk of this one system.
+/// First implemented with only `noqueue` (plus a few other common defaults never actually
+/// observed) and caught by testing `hotstream0`'s own first-time setup against this exact
+/// check: it does not get to skip the "is this actually a default" question just because *this*
+/// module is what creates it moments later. Anything else — most plausibly something a
+/// *different* tool deliberately configured — is left alone; see `has_our_htb_root`'s caller
+/// for what that means for the caller. Not a defence against a determined adversary (there is
+/// none for a local, single-user desktop app), just against silently overwriting another tool's
+/// queueing discipline, per CLAUDE.md's "only modify rules/objects it owns" / "do not disturb
+/// ... unrelated tc state".
+const SAFE_DEFAULT_ROOT_QDISCS: &[&str] = &["noqueue", "pfifo_fast", "fq_codel", "mq", "noop"];
+
+/// The current root qdisc's kind, e.g. `"noqueue"` or `"htb"`. `None` only if `dev` itself does
+/// not exist (a root qdisc otherwise always exists, even on an entirely unconfigured device).
+fn root_qdisc_kind(dev: &str) -> Result<Option<String>, ShapingError> {
+    Ok(list_qdiscs(dev, None)?.into_iter().find(|q| q.root).map(|q| q.kind))
+}
+
 fn has_ingress_qdisc(dev: &str) -> Result<bool, ShapingError> {
     Ok(!list_qdiscs(dev, Some("ingress"))?.is_empty())
 }
@@ -234,6 +276,14 @@ struct RawFilterOptions {
     classid: Option<String>,
     #[serde(default)]
     keys: Option<RawFlowerKeys>,
+    #[serde(default)]
+    actions: Vec<RawAction>,
+}
+
+#[derive(Deserialize)]
+struct RawAction {
+    #[serde(default)]
+    to_dev: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -248,8 +298,15 @@ fn list_filters(dev: &str, parent: &str) -> Result<Vec<RawFilter>, ShapingError>
     parse_json("`tc filter show`", exec::run("tc", &["-j", "filter", "show", "dev", dev, "parent", parent], TC_TIMEOUT))
 }
 
-fn has_redirect_filter(dev: &str) -> Result<bool, ShapingError> {
-    Ok(list_filters(dev, INGRESS_HANDLE)?.iter().any(|f| f.kind.as_deref() == Some("matchall")))
+/// Specifically *our* redirect filter — one whose action targets `hotstream0` — not just "some
+/// matchall filter", so a foreign one (however unlikely) is never mistaken for ours. This is
+/// what lets `ensure_redirect`/`clear_all` tell "already ours, safe to build on / safe to
+/// remove" apart from "something else is using this interface's one ingress hook".
+fn has_our_redirect_filter(dev: &str) -> Result<bool, ShapingError> {
+    Ok(list_filters(dev, INGRESS_HANDLE)?.iter().any(|f| {
+        f.kind.as_deref() == Some("matchall")
+            && f.options.as_ref().is_some_and(|o| o.actions.iter().any(|a| a.to_dev.as_deref() == Some(IFB)))
+    }))
 }
 
 /// Every MAC currently classified on `dev`'s client-facing chain, and which classid it maps
@@ -328,8 +385,16 @@ pub fn read_state(iface: &str) -> Result<Vec<BandwidthLimit>, ShapingError> {
 /// call on every `set_limit`. Creates the shared HTB hierarchy on `dev` if it is not already
 /// there, and restates the parent/default classes' rate either way — restating an unchanged
 /// rate is a harmless no-op (`class replace`, verified idempotent).
+///
+/// Refuses (`ForeignRootQdisc`) rather than replacing `dev`'s root qdisc when it is neither
+/// already ours nor a recognised unconfigured default — see `SAFE_DEFAULT_ROOT_QDISCS`.
 fn ensure_htb_hierarchy(dev: &str) -> Result<(), ShapingError> {
     if !has_our_htb_root(dev)? {
+        match root_qdisc_kind(dev)? {
+            Some(kind) if SAFE_DEFAULT_ROOT_QDISCS.contains(&kind.as_str()) => {}
+            Some(kind) => return Err(ShapingError::ForeignRootQdisc { dev: dev.to_string(), kind }),
+            None => {} // no root qdisc at all is not a state we have ever observed, but nothing to refuse either
+        }
         exec::run(
             "tc",
             &["qdisc", "replace", "dev", dev, "root", "handle", ROOT_HANDLE, "htb", "default", &DEFAULT_CLASSID_NUM.to_string()],
@@ -369,20 +434,31 @@ fn ensure_ifb() -> Result<(), ShapingError> {
 /// Idempotent. Ensures `hotstream0` exists and that `iface`'s ingress traffic is redirected to
 /// it, creating each piece only if it is not already there (see the module doc for why this,
 /// unlike `ensure_htb_hierarchy`, cannot just reissue everything unconditionally).
+///
+/// A device can only ever have one ingress qdisc, and — unlike a root qdisc's `kind` — nothing
+/// about an ingress qdisc itself distinguishes "ours" from "something else's": the only
+/// reliable signal is whether *our specific* redirect filter is attached underneath it. So: no
+/// ingress qdisc at all → create both fresh. Ingress qdisc present with our filter attached →
+/// already fully ours, a no-op. Ingress qdisc present *without* our filter → something else is
+/// using this interface's one ingress hook (or, far less likely, our own filter was removed out
+/// from under an ingress qdisc we did create) — refused either way, since silently adding a
+/// filter to a qdisc we cannot confirm is ours risks interfering with whatever created it.
 fn ensure_redirect(iface: &str) -> Result<(), ShapingError> {
     ensure_ifb()?;
-    if !has_ingress_qdisc(iface)? {
-        exec::run("tc", &["qdisc", "add", "dev", iface, "handle", INGRESS_HANDLE, "ingress"], TC_TIMEOUT)?;
-    }
-    if !has_redirect_filter(iface)? {
-        exec::run(
-            "tc",
-            &[
-                "filter", "add", "dev", iface, "parent", INGRESS_HANDLE, "protocol", "all", "prio", "1", "matchall",
-                "action", "mirred", "egress", "redirect", "dev", IFB,
-            ],
-            TC_TIMEOUT,
-        )?;
+    match (has_ingress_qdisc(iface)?, has_our_redirect_filter(iface)?) {
+        (true, true) => {} // already fully ours
+        (true, false) => return Err(ShapingError::ForeignIngressQdisc { iface: iface.to_string() }),
+        (false, _) => {
+            exec::run("tc", &["qdisc", "add", "dev", iface, "handle", INGRESS_HANDLE, "ingress"], TC_TIMEOUT)?;
+            exec::run(
+                "tc",
+                &[
+                    "filter", "add", "dev", iface, "parent", INGRESS_HANDLE, "protocol", "all", "prio", "1", "matchall",
+                    "action", "mirred", "egress", "redirect", "dev", IFB,
+                ],
+                TC_TIMEOUT,
+            )?;
+        }
     }
     Ok(())
 }
@@ -469,22 +545,33 @@ pub fn set_limit(iface: &str, mac: &str, download_kbit: Option<u32>, upload_kbit
 /// device, and the shared HTB hierarchy on `iface` itself — reverting it to whatever qdisc the
 /// kernel assigns once its root is gone (`noqueue`, in practice). Not wired to the UI; exposed
 /// for testing and manual rollback, mirroring `kernel::clear`.
+///
+/// Each of the two qdiscs on `iface` is deleted only once ownership is confirmed the same way
+/// `ensure_htb_hierarchy`/`ensure_redirect` confirm it before building on top of one — this
+/// must never delete a qdisc it cannot prove is its own, exactly as it must never silently
+/// replace one. `hotstream0` itself needs no such check: nothing but Hot-Stream would ever
+/// create a device with that exact name, so its removal is unconditional (tolerating "already
+/// absent").
 pub fn clear_all(iface: &str) -> Result<Vec<BandwidthLimit>, ShapingError> {
     let iface = validated_iface(iface)?;
-    match exec::run("tc", &["qdisc", "del", "dev", &iface, "ingress"], TC_TIMEOUT) {
-        Ok(_) => {}
-        Err(DiscoveryError::CommandFailed { stderr, .. }) if is_missing_qdisc(&stderr) || is_missing_device(&stderr) => {}
-        Err(e) => return Err(e.into()),
+    if has_our_redirect_filter(&iface)? {
+        match exec::run("tc", &["qdisc", "del", "dev", &iface, "ingress"], TC_TIMEOUT) {
+            Ok(_) => {}
+            Err(DiscoveryError::CommandFailed { stderr, .. }) if is_missing_qdisc(&stderr) || is_missing_device(&stderr) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     match exec::run("ip", &["link", "del", IFB], IP_TIMEOUT) {
         Ok(_) => {}
         Err(DiscoveryError::CommandFailed { stderr, .. }) if is_missing_link(&stderr) => {}
         Err(e) => return Err(e.into()),
     }
-    match exec::run("tc", &["qdisc", "del", "dev", &iface, "root"], TC_TIMEOUT) {
-        Ok(_) => {}
-        Err(DiscoveryError::CommandFailed { stderr, .. }) if is_missing_qdisc(&stderr) || is_missing_device(&stderr) => {}
-        Err(e) => return Err(e.into()),
+    if has_our_htb_root(&iface)? {
+        match exec::run("tc", &["qdisc", "del", "dev", &iface, "root"], TC_TIMEOUT) {
+            Ok(_) => {}
+            Err(DiscoveryError::CommandFailed { stderr, .. }) if is_missing_qdisc(&stderr) || is_missing_device(&stderr) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(Vec::new())
 }
@@ -609,6 +696,64 @@ mod tests {
         let opts = entry.options.as_ref().unwrap();
         assert_eq!(opts.classid.as_deref(), Some("1:10"));
         assert_eq!(opts.keys.as_ref().unwrap().dst_mac.as_deref(), Some("ce:da:1e:90:d4:aa"));
+    }
+
+    #[test]
+    fn root_qdisc_kind_is_read_from_whichever_entry_has_root_true() {
+        let json = r#"[
+            {"kind":"ingress","handle":"ffff:","parent":"ffff:fff1","options":{}},
+            {"kind":"noqueue","handle":"0:","root":true,"refcnt":2,"options":{}}
+        ]"#;
+        let qdiscs: Vec<RawQdisc> = serde_json::from_str(json).unwrap();
+        assert_eq!(qdiscs.into_iter().find(|q| q.root).map(|q| q.kind), Some("noqueue".to_string()));
+    }
+
+    #[test]
+    fn every_recognised_default_root_qdisc_kind_is_treated_as_safe_to_replace() {
+        for kind in SAFE_DEFAULT_ROOT_QDISCS {
+            assert!(SAFE_DEFAULT_ROOT_QDISCS.contains(kind));
+        }
+        assert!(!SAFE_DEFAULT_ROOT_QDISCS.contains(&"hfsc"), "an unrecognised kind must not be treated as a safe default");
+    }
+
+    /// Security/isolation-critical: a filter's `to_dev` must specifically name `hotstream0` to
+    /// count as ours — a redirect to any *other* device (however implausible in practice) must
+    /// never be mistaken for Hot-Stream's own, since that mistake is what would let `clear_all`
+    /// delete something it does not own.
+    #[test]
+    fn a_matchall_filter_redirecting_to_a_different_device_is_not_mistaken_for_ours() {
+        let json = r#"[{"parent":"ffff:","protocol":"all","pref":1,"kind":"matchall","chain":0,
+            "options":{"handle":1,"actions":[{"order":1,"kind":"mirred","mirred_action":"redirect",
+            "direction":"egress","to_dev":"some-other-ifb","control_action":{"type":"stolen"}}]}}]"#;
+        let filters: Vec<RawFilter> = serde_json::from_str(json).unwrap();
+        let is_ours = filters.iter().any(|f| {
+            f.kind.as_deref() == Some("matchall")
+                && f.options.as_ref().is_some_and(|o| o.actions.iter().any(|a| a.to_dev.as_deref() == Some(IFB)))
+        });
+        assert!(!is_ours);
+    }
+
+    #[test]
+    fn a_matchall_filter_redirecting_to_hotstream0_is_recognised_as_ours() {
+        let json = r#"[{"parent":"ffff:","protocol":"all","pref":1,"kind":"matchall","chain":0,
+            "options":{"handle":1,"actions":[{"order":1,"kind":"mirred","mirred_action":"redirect",
+            "direction":"egress","to_dev":"hotstream0","control_action":{"type":"stolen"}}]}}]"#;
+        let filters: Vec<RawFilter> = serde_json::from_str(json).unwrap();
+        let is_ours = filters.iter().any(|f| {
+            f.kind.as_deref() == Some("matchall")
+                && f.options.as_ref().is_some_and(|o| o.actions.iter().any(|a| a.to_dev.as_deref() == Some(IFB)))
+        });
+        assert!(is_ours);
+    }
+
+    #[test]
+    fn foreign_root_qdisc_and_ingress_qdisc_errors_name_the_device_and_are_actionable() {
+        let err = ShapingError::ForeignRootQdisc { dev: "wlo1".into(), kind: "hfsc".into() };
+        let msg = err.to_string();
+        assert!(msg.contains("wlo1") && msg.contains("hfsc"), "{msg}");
+
+        let err = ShapingError::ForeignIngressQdisc { iface: "wlo1".into() };
+        assert!(err.to_string().contains("wlo1"), "{}", err);
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   bandwidthFor,
   clientStatus,
+  describeLimit,
   displayName,
   formatBytes,
   formatClock,
@@ -176,8 +177,15 @@ function bandwidthCell(
   const pending = view.bandwidthPending.has(c.mac);
   const unavailable = view.enforcement === null;
 
+  const unavailableTitle = view.enforcementError
+    ? "Bandwidth limits are unavailable — see the notice above."
+    : "Reading enforcement state…";
+
   const field = (direction: "download" | "upload", value: string, label: string): HTMLInputElement => {
-    const input = el("input", { class: "rate-input", title: `${label}, Mbps — empty = unlimited` });
+    const input = el("input", {
+      class: "rate-input",
+      title: unavailable ? unavailableTitle : `${label}, Mbps — empty = unlimited`,
+    });
     input.type = "number";
     input.min = "0";
     input.step = "any";
@@ -190,6 +198,7 @@ function bandwidthCell(
 
   const applyBtn = el("button", { class: "apply-rate", text: pending ? "…" : "Set" });
   applyBtn.disabled = pending || unavailable;
+  if (unavailable) applyBtn.title = unavailableTitle;
   applyBtn.addEventListener("click", () => onApply(c.mac));
 
   const children: (Node | string)[] = [
@@ -227,13 +236,19 @@ function clientRow(
     );
   }
   const status = clientStatus(c, view.enforcement);
+  const limit = bandwidthFor(c.mac, view.enforcement);
+  const limited = isBandwidthLimited(limit);
+  const stateCell = el("td", { text: STATUS_LABEL[status] });
+  if (limited && limit) {
+    stateCell.append(" ", el("span", { class: "badge limited", text: "limited", title: describeLimit(limit) }));
+  }
   return el(
     "tr",
-    { class: status },
+    { class: limited ? `${status} limited` : status },
     el("td", { class: c.hostname ? "" : "muted", text: displayName(c) }),
     mac,
     el("td", { class: "mono", text: c.ip ?? "—", title: c.ip ? "" : "No live neighbour-table entry for this device yet" }),
-    el("td", { text: STATUS_LABEL[status] }),
+    stateCell,
     el("td", { text: formatSignal(c.signalDbm) }),
     el("td", { text: formatDuration(c.connectedSecs) }),
     el("td", { text: formatIdle(c.inactiveMs), title: "Time since the access point last heard from this device" }),

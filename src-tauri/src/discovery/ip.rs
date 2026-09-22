@@ -111,7 +111,7 @@ pub fn ipv4_by_mac(neighbours: &[Neighbour]) -> HashMap<Mac, Ipv4Addr> {
             continue;
         };
         let key = (rank, n.confirmed_secs.unwrap_or(u64::MAX));
-        if best.get(mac).map_or(true, |(current, _)| key < *current) {
+        if best.get(mac).is_none_or(|(current, _)| key < *current) {
             best.insert(mac.clone(), (key, ip));
         }
     }

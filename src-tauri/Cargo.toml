@@ -30,6 +30,10 @@ serde_json = "1"
 # GUI. A small, well-established wrapper around capset/prctl — hand-rolling the raw capset(2)
 # struct layout/versioning for this security-sensitive step is not worth the risk.
 caps = "0.5"
+# Only used by src/enforce/lock.rs, for a single `flock()` call serializing concurrent helper
+# invocations. Already present transitively (pulled in by `caps` and others); declared directly
+# here because this crate calls it itself rather than only depending on it by accident.
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

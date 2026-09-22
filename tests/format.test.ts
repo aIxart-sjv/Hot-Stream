@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   bandwidthFor,
   clientStatus,
+  describeLimit,
   displayName,
   formatBytes,
   formatClock,
@@ -170,4 +171,9 @@ test("isBandwidthLimited is false when unknown, false when both directions are u
   assert.equal(isBandwidthLimited({ downloadKbit: null, uploadKbit: null }), false);
   assert.equal(isBandwidthLimited({ downloadKbit: 5000, uploadKbit: null }), true);
   assert.equal(isBandwidthLimited({ downloadKbit: null, uploadKbit: 1000 }), true);
+});
+
+test("describeLimit summarises both directions on one line", () => {
+  assert.equal(describeLimit({ downloadKbit: 5000, uploadKbit: null }), "Download 5 Mbps, Upload unlimited");
+  assert.equal(describeLimit({ downloadKbit: null, uploadKbit: 512 }), "Download unlimited, Upload 0.512 Mbps");
 });

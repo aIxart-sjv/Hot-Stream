@@ -37,6 +37,7 @@
 pub mod ambient;
 pub mod helper_client;
 pub mod kernel;
+pub mod lock;
 pub mod shaping;
 
 use serde::{Deserialize, Serialize};

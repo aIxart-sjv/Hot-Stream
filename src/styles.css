@@ -104,6 +104,11 @@ tr.blocked td { color: var(--blocked); }
 tr.blocked { background: var(--blocked-bg); }
 tr.deniedMax td { color: var(--denied); }
 tr.deniedMax { background: var(--denied-bg); }
+/* A thin accent stripe, not a background wash: bandwidth-limited composes with any other
+   status (a client can be limited *and* connected, or limited *and* blocked) rather than
+   replacing it, so it must stay visible without fighting the stronger blocked/deniedMax
+   backgrounds when both apply to the same row. */
+tr.limited { box-shadow: inset 3px 0 0 var(--accent); }
 
 .mono { font-family: ui-monospace, monospace; font-size: 13px; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -192,5 +197,6 @@ button.apply-rate:disabled { opacity: 0.5; cursor: default; }
   border-radius: 999px;
   color: var(--muted);
 }
+.badge.limited { color: var(--accent); border-color: var(--accent); }
 
 footer { margin-top: 14px; color: var(--muted); font-size: 12px; }
