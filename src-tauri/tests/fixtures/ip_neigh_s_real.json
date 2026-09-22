@@ -1,0 +1,1 @@
+[{"dst":"10.42.0.99","lladdr":"02:00:00:00:00:01","refcnt":1,"used":18,"confirmed":18,"updated":18,"probes":1,"state":["REACHABLE"]},{"dst":"fe80::ff:fe00:1","lladdr":"02:00:00:00:00:01","router":null,"refcnt":1,"used":373,"confirmed":0,"updated":373,"probes":1,"state":["REACHABLE"]}]

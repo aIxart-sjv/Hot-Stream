@@ -1,0 +1,33 @@
+Station 02:00:00:00:00:01 (on wlo1)
+	authorized:	yes
+	authenticated:	yes
+	associated:	yes
+	preamble:	long
+	WMM/WME:	yes
+	MFP:		no
+	TDLS peer:	no
+	inactive time:	13 ms
+	rx bytes:	3095553
+	rx packets:	7173
+	tx bytes:	2706528
+	tx packets:	5536
+	tx retries:	18
+	tx failed:	0
+	beacon loss:	0
+		beacon rx:	4562
+	rx drop misc:	17
+	signal:  	-29 [-35, -29] dBm
+	signal avg:	-31 dBm
+	beacon signal avg:	-23 dBm
+	tx bitrate:	144.4 MBit/s MCS 15 short GI
+	tx duration:	0 us
+	rx bitrate:	144.4 MBit/s MCS 15 short GI
+	rx duration:	0 us
+	DTIM period:	2
+	beacon interval:100
+	short preamble:	yes
+	connected time:	752 seconds
+	associated at [boottime]:	11.881s
+	associated at:	1790003216806 ms
+	current time:	1790003967968 ms
+

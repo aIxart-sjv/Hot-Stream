@@ -1,0 +1,157 @@
+#!/bin/sh
+# NetworkManager dispatcher script: gives a NetworkManager "shared" (hotspot) connection
+# working Internet forwarding + NAT.
+#
+# NOT part of Hot-Stream's GUI or privileged helper, and not installed by either of them —
+# see contrib/system/README.md for why this exists as a separate, manually-installed
+# system component and what it does and does not touch.
+#
+# Root cause this works around: this system's NetworkManager only configures NAT/forwarding
+# for a "shared" connection by talking to firewalld; without firewalld installed, it brings
+# up the DHCP/IP side of a hotspot and does nothing else (confirmed: zero firewall-related
+# log lines during real hotspot activation, and NetworkManager's own binary only references
+# org.freedesktop.NetworkManager's firewalld D-Bus integration for this).
+#
+# Mechanism (verified empirically before this was written — see the M2 conversation's
+# priority-isolation tests): nftables does NOT let a separate table's early "accept" verdict
+# override a later, independent table's own policy — only an explicit "drop" is immediately
+# authoritative across chains at the same hook. Docker's own `ip filter FORWARD` chain has
+# `policy drop`. So the only mechanism that actually works, without touching UFW/libvirt at
+# all and without altering any of Docker's own rules, is to ADD two narrowly-scoped ACCEPT
+# rules to the FRONT of Docker's own FORWARD chain's rule list — purely additive, tagged
+# with nft comments so this script can find and remove precisely those two rules and nothing
+# else. NAT lives in its own fully separate, fully-owned table (no ordering dependency).
+#
+# Dispatcher contract (NetworkManager-dispatcher(8)): scripts run one at a time, are given
+# the interface as $1 and the action as $2, and — importantly — a script can still run after
+# the event it reacted to is already obsolete. So this never trusts $1/$2 as current truth:
+# every run re-derives the actual current state (is a shared connection active right now?
+# on which interface? what is the current default-route uplink?) and reconciles the kernel
+# to match. That makes it safe to call for any interface's up/down event, in any order, any
+# number of times — including hotspot restarts and uplink changes while the hotspot runs.
+#
+# What this script owns, and only what it owns:
+#   - two rules inside Docker's real `ip filter FORWARD` chain, tagged with nft comments
+#     ("hotstream-uplink-fwd-out" / "hotstream-uplink-fwd-in") — never anything else in
+#     that chain, and Docker's own rules are never edited, reordered, or removed.
+#   - one small, separate table (`ip hotstream-uplink-nat`) it fully owns.
+# UFW and libvirt's own tables/chains are never read or written by this script at all.
+
+set -u
+
+NFT=/usr/bin/nft
+NMCLI=/usr/bin/nmcli
+LOGGER=/usr/bin/logger
+TAG_OUT="hotstream-uplink-fwd-out"
+TAG_IN="hotstream-uplink-fwd-in"
+NAT_TABLE="hotstream-uplink-nat"
+
+log() { "$LOGGER" -t hotstream-uplink "$*" 2>/dev/null || true; }
+
+# Remove exactly the rules this script owns. Safe to call when none are present.
+remove_owned() {
+	for tag in "$TAG_OUT" "$TAG_IN"; do
+		handles=$("$NFT" -j list chain ip filter FORWARD 2>/dev/null \
+			| jq -r --arg tag "$tag" \
+				'.nftables[]? | select(.rule?.comment==$tag) | .rule.handle' 2>/dev/null) || handles=""
+		for h in $handles; do
+			"$NFT" delete rule ip filter FORWARD handle "$h" 2>/dev/null \
+				&& log "removed forwarding rule $tag (handle $h)"
+		done
+	done
+	"$NFT" delete table ip "$NAT_TABLE" 2>/dev/null && log "removed $NAT_TABLE"
+	return 0
+}
+
+# Install forwarding + NAT for exactly this (hotspot_iface, uplink_iface, addr_cidr) triple.
+# Assumes remove_owned has just been called, so this never duplicates anything.
+install_for() {
+	hotspot_iface=$1
+	uplink_iface=$2
+	addr_cidr=$3
+
+	"$NFT" insert rule ip filter FORWARD position 0 \
+		iifname "$hotspot_iface" oifname "$uplink_iface" accept comment "\"$TAG_OUT\""
+	"$NFT" insert rule ip filter FORWARD position 0 \
+		iifname "$uplink_iface" oifname "$hotspot_iface" ct state established,related accept comment "\"$TAG_IN\""
+
+	"$NFT" add table ip "$NAT_TABLE"
+	"$NFT" add chain ip "$NAT_TABLE" post '{ type nat hook postrouting priority srcnat; policy accept; }'
+	"$NFT" flush chain ip "$NAT_TABLE" post
+	# nft masks a host address with its prefix length automatically (10.42.0.1/24 is stored
+	# and matched as 10.42.0.0/24) — no separate network-address computation needed.
+	"$NFT" add rule ip "$NAT_TABLE" post ip saddr "$addr_cidr" oifname != "$hotspot_iface" masquerade
+
+	log "installed: hotspot=$hotspot_iface uplink=$uplink_iface subnet=$addr_cidr"
+}
+
+# The interface currently running a NetworkManager "shared" connection, if any. Never
+# assumes the interface named in $1/$2 is still relevant — re-derives from live state.
+find_hotspot_iface() {
+	active=$("$NMCLI" -t -f NAME,DEVICE connection show --active 2>/dev/null) || return 0
+	old_ifs=$IFS
+	IFS='
+'
+	for line in $active; do
+		name=${line%%:*}
+		dev=${line#*:}
+		[ -z "$dev" ] && continue
+		method=$("$NMCLI" -g ipv4.method connection show "$name" 2>/dev/null) || continue
+		if [ "$method" = "shared" ]; then
+			IFS=$old_ifs
+			printf '%s' "$dev"
+			return 0
+		fi
+	done
+	IFS=$old_ifs
+	return 0
+}
+
+# The current default-route interface, excluding the hotspot's own interface (so its own
+# route, if any, is never mistaken for an uplink). Not hardcoded to any interface name.
+find_uplink_iface() {
+	hotspot_iface=$1
+	ip -4 route show default 2>/dev/null \
+		| awk -v h="$hotspot_iface" '{for(i=1;i<=NF;i++) if($i=="dev" && $(i+1)!=h){print $(i+1); exit}}'
+}
+
+reconcile() {
+	hotspot_iface=$(find_hotspot_iface)
+
+	if [ -z "$hotspot_iface" ]; then
+		remove_owned
+		return 0
+	fi
+
+	addr_cidr=$(ip -4 -o addr show dev "$hotspot_iface" scope global 2>/dev/null | awk '{print $4; exit}')
+	if [ -z "$addr_cidr" ]; then
+		log "hotspot iface $hotspot_iface has no IPv4 address yet; nothing to reconcile this run"
+		return 0
+	fi
+
+	uplink_iface=$(find_uplink_iface "$hotspot_iface")
+	if [ -z "$uplink_iface" ]; then
+		log "hotspot iface $hotspot_iface is active but no other default route exists"
+		remove_owned
+		return 0
+	fi
+
+	# Always remove-then-reinstall rather than trying to detect "already correct": simpler,
+	# and just as safe — this only runs on real up/down transitions, not continuously.
+	remove_owned
+	install_for "$hotspot_iface" "$uplink_iface" "$addr_cidr"
+}
+
+main() {
+	action=${2:-${NM_DISPATCHER_ACTION:-}}
+	case "$action" in
+		up | down) reconcile ;;
+		*) : ;; # only interface state transitions are relevant here
+	esac
+}
+
+# Sourced by the test harness (HOTSTREAM_UPLINK_TEST=1) to call the functions above
+# directly, with real nft but fake nmcli/ip-route results — see contrib/system/test/.
+if [ "${HOTSTREAM_UPLINK_TEST:-0}" != "1" ]; then
+	main "$@"
+fi

@@ -1,0 +1,39 @@
+[package]
+name = "hot-stream"
+version = "0.1.0"
+description = "Linux desktop control panel for the Wi-Fi hotspot hosted by this laptop"
+edition = "2021"
+# Disambiguates the GUI app from the second [[bin]] (hot-stream-helper) below — required by
+# `tauri build`/`cargo run` once a package has more than one binary target.
+default-run = "hot-stream"
+
+[lib]
+# The `_lib` suffix keeps the library name distinct from the binary name.
+name = "hot_stream_lib"
+# Desktop/Linux only: no staticlib/cdylib (those exist for Tauri mobile targets).
+crate-type = ["rlib"]
+
+[[bin]]
+# The entire privileged surface of Hot-Stream (see src/bin/hot-stream-helper.rs). Run
+# un-elevated; granted CAP_NET_ADMIN via `setcap` on the built binary, once, by an admin.
+name = "hot-stream-helper"
+path = "src/bin/hot-stream-helper.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Only used by src/enforce/ambient.rs (hot-stream-helper's capability setup). Not used by the
+# GUI. A small, well-established wrapper around capset/prctl — hand-rolling the raw capset(2)
+# struct layout/versioning for this security-sensitive step is not worth the risk.
+caps = "0.5"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
